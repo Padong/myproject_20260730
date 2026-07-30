@@ -57,7 +57,6 @@ def load_data():
     df['65세이상인구'] = df[age_65_cols].sum(axis=1)
     
     # 시군구 단위로 연도별 집계 (시도, 시군구 이름 보존)
-    # 한 시군구 코드에 여러 읍면동이 포함되어 있으므로 sum 처리
     grouped = df.groupby(['연도', 'sigungu_code', '시도', '시군구'], as_index=False)[['총인구', '65세이상인구']].sum()
     
     # 고령화율(%) 계산
@@ -65,10 +64,12 @@ def load_data():
     grouped['고령화율'] = grouped['고령화율'].round(2)
     
     # 5단계 구간 나누기 (19%, 23%, 28%, 38% 기준)
-    # 0: ~19 미만, 1: 19~23, 2: 23~28, 3: 28~38, 4: 38 이상
     bins = [0, 19, 23, 28, 38, 100]
     labels = ['19% 미만', '19% ~ 23%', '23% ~ 28%', '28% ~ 38%', '38% 이상']
     grouped['고령화구간'] = pd.cut(grouped['고령화율'], bins=bins, labels=labels, right=False)
+    
+    # 시군구 식별용 풀네임 생성 (예: '서울특별시 강남구')
+    grouped['지역풀네임'] = grouped['시도'] + " " + grouped['시군구']
     
     # 연령대별 세부 분석용 원본 읍면동 데이터도 시군구 단위로 합산하여 반환
     df_age_grouped = df.groupby(['연도', 'sigungu_code'])[total_cols].sum().reset_index()
@@ -78,42 +79,67 @@ def load_data():
 geojson_data = load_geojson()
 pop_data, age_data = load_data()
 
-# available years
+# 사용 가능한 연도 목록
 years = sorted(pop_data['연도'].unique())
 max_year = max(years)
 
-# -----------------------------------------------------------------------------
-# 3. 사이드바 및 시뮬레이션 제어
-# -----------------------------------------------------------------------------
-st.sidebar.header("⚙️ 지도 제어")
+# 시군구 풀네임 - 코드를 연결하는 매핑 사전 생성
+region_info_df = pop_data[['지역풀네임', 'sigungu_code']].drop_duplicates().sort_values('지역풀네임')
+region_options = ["전체 (전국 지도)"] + list(region_info_df['지역풀네임'])
+code_to_name = dict(zip(region_info_df['sigungu_code'], region_info_df['지역풀네임']))
+name_to_code = dict(zip(region_info_df['지역풀네임'], region_info_df['sigungu_code']))
 
-# 애니메이션 시뮬레이션 재생 기능
+# -----------------------------------------------------------------------------
+# 3. 세션 상태(Session State) 초기화
+# -----------------------------------------------------------------------------
 if 'selected_year' not in st.session_state:
     st.session_state['selected_year'] = max_year
 
+if 'selected_region' not in st.session_state:
+    st.session_state['selected_region'] = "전체 (전국 지도)"
+
+if 'pie_year' not in st.session_state:
+    st.session_state['pie_year'] = max_year
+
+# -----------------------------------------------------------------------------
+# 4. 사이드바 제어
+# -----------------------------------------------------------------------------
+st.sidebar.header("⚙️ 지도 및 지역 제어")
+
+# 1) 연도 선택
+selected_year = st.sidebar.selectbox(
+    "📅 조회할 연도",
+    years,
+    index=years.index(st.session_state['selected_year']),
+    key='year_selectbox'
+)
+st.session_state['selected_year'] = selected_year
+
+# 2) 지역 선택 (추가된 기능)
+selected_region = st.sidebar.selectbox(
+    "🏢 조회할 지역",
+    region_options,
+    index=region_options.index(st.session_state['selected_region']) if st.session_state['selected_region'] in region_options else 0,
+    key='region_selectbox'
+)
+st.session_state['selected_region'] = selected_region
+
+# 3) 애니메이션 시뮬레이션 버튼
 def run_simulation():
     for y in years:
         st.session_state['selected_year'] = y
-        time.sleep(0.6)
+        time.sleep(0.5)
         st.rerun()
 
 if st.sidebar.button("▶️ 2015~2026 연도별 변화 시뮬레이션"):
     run_simulation()
 
-selected_year = st.sidebar.selectbox(
-    "조회할 연도 선택",
-    years,
-    index=years.index(st.session_state['selected_year'])
-)
-st.session_state['selected_year'] = selected_year
-
-# 해당 연도 데이터 필터링
+# 선택된 연도 데이터 필터링
 current_df = pop_data[pop_data['연도'] == selected_year].copy()
 
 # -----------------------------------------------------------------------------
-# 4. plotly 단계구분도 (Choropleth) 생성
+# 5. Plotly 단계구분도 (Choropleth Map) 생성
 # -----------------------------------------------------------------------------
-# 5단계 범례 색상 지정 (옅은 주황 -> 진한 Red-Purple)
 color_discrete_map = {
     '19% 미만': '#fef0d9',
     '19% ~ 23%': '#fdcc8a',
@@ -128,12 +154,12 @@ fig = px.choropleth_mapbox(
     current_df,
     geojson=geojson_data,
     locations='sigungu_code',
-    featureidkey="properties.코드", # GeoJSON의 5자리 '코드' 속성과 매칭
+    featureidkey="properties.코드",
     color='고령화구간',
     color_discrete_map=color_discrete_map,
     category_orders=category_orders,
-    mapbox_style="white-bg", # 배경 지도 타일 없이 경계선만 표시
-    center={"lat": 35.9, "lon": 127.8}, # 대한민국 중심 좌표
+    mapbox_style="white-bg",
+    center={"lat": 35.9, "lon": 127.8},
     zoom=6.2,
     hover_name='시군구',
     hover_data={
@@ -156,17 +182,26 @@ fig.update_traces(
 )
 
 fig.update_layout(
-    margin={"r":0,"t":30,"l":0,"b":0},
-    title=f"<b>[{selected_year}년] 전국 시군구 고령화율 지도</b>",
+    margin={"r":0, "t":30, "l":0, "b":0},
+    title=f"<b>[{selected_year}년] 전국 시군구 고령화율 지도</b> (지도를 클릭하면 해당 지역 분석이 열립니다)",
     legend_title_text="<b>고령화 비율 구간</b>",
-    clickmode='event+select' # 지역 클릭 이벤트를 받아오기 위해 설정
+    clickmode='event+select'
 )
 
-# 지도 출력 및 클릭 이벤트 감지
-map_event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points")
+# 지도 출력 및 클릭 이벤트 처리
+map_event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="main_map")
+
+# 지도를 클릭했을 때 클릭한 지역을 세션 상태에 반영
+if map_event and "selection" in map_event and len(map_event["selection"]["points"]) > 0:
+    clicked_code = map_event["selection"]["points"][0]["location"]
+    if clicked_code in code_to_name:
+        clicked_region_name = code_to_name[clicked_code]
+        if st.session_state['selected_region'] != clicked_region_name:
+            st.session_state['selected_region'] = clicked_region_name
+            st.rerun()
 
 # -----------------------------------------------------------------------------
-# 5. 고령화율 상위/하위 10개 지역 표
+# 6. 고령화율 상위/하위 10개 지역 표 (메인 화면)
 # -----------------------------------------------------------------------------
 st.subheader(f"📊 {selected_year}년 고령화율 극단 지역 (상위/하위 10개)")
 
@@ -184,26 +219,20 @@ with col2:
     st.dataframe(bottom10.reset_index(drop=True), use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# 6. 지역 클릭 시 팝업(Modal) 분석창 및 원그래프 연동
+# 7. 선택된 지역 팝업(Dialog) 창 - 추이 그래프 & 원그래프 연동 개선
 # -----------------------------------------------------------------------------
-# 지도에서 특정 시군구를 클릭했는지 확인
-if map_event and "selection" in map_event and len(map_event["selection"]["points"]) > 0:
-    clicked_point = map_event["selection"]["points"][0]
-    clicked_code = clicked_point["location"]
-    
-    # 클릭한 지역 정보 가져오기
-    target_info = pop_data[pop_data['sigungu_code'] == clicked_code].iloc[0]
-    target_name = f"{target_info['시도']} {target_info['시군구']}"
-    
-    # Streamlit 팝업 창(Modal) 생성
-    @st.dialog(f"🔍 {target_name} 세부 고령화 분석", width="large")
-    def show_detail_modal(code, name):
+if st.session_state['selected_region'] != "전체 (전국 지도)":
+    region_full_name = st.session_state['selected_region']
+    target_code = name_to_code.get(region_full_name)
+
+    @st.dialog(f"🔍 {region_full_name} 고령화 상세 분석", width="large")
+    def show_detail_dialog(code, name):
         st.write(f"**행정구역 코드:** `{code}`")
         
-        # 1) 시군구의 연도별 고령화율 추이 데이터
+        # 1) 시군구 연도별 추이 데이터
         region_history = pop_data[pop_data['sigungu_code'] == code].sort_values('연도')
         
-        # 2) 꺾은선 그래프 (연도별 추이)
+        # 2) 추이 꺾은선 그래프
         fig_line = px.line(
             region_history,
             x='연도',
@@ -212,28 +241,47 @@ if map_event and "selection" in map_event and len(map_event["selection"]["points
             title=f"📈 {name} 연도별 고령화율 추이 (2015~2026)",
             labels={'고령화율': '고령화율 (%)', '연도': '연도'}
         )
-        fig_line.update_traces(line_color='#e34a33', line_width=3, marker_size=8)
+        
+        fig_line.update_traces(
+            mode='lines+markers',
+            marker=dict(size=10, color='#e34a33'),
+            line=dict(color='#e34a33', width=3),
+            hovertemplate="<b>%{x}년</b><br>고령화율: <b>%{y:.2f}%</b><extra></extra>"
+        )
+        
         fig_line.update_layout(clickmode='event+select')
         
-        st.markdown("👇 **그래프의 연도 포인트를 클릭**하면 해당 연도의 **연령별 인구 분포(원그래프)**를 확인할 수 있습니다.")
-        line_event = st.plotly_chart(fig_line, use_container_width=True, on_select="rerun", selection_mode="points")
+        st.markdown("💡 **그래프 상의 연도 포인트를 클릭**하거나 아래 **슬라이더**를 조작하여 원그래프 연도를 변경하세요.")
         
-        # 선택된 연도 판별 (추이 그래프 클릭 시 선택된 연도, 클릭 없을 시 기본 2026년/최신연도)
-        pie_year = selected_year
+        line_event = st.plotly_chart(fig_line, use_container_width=True, on_select="rerun", key="trend_line_chart")
+        
+        # 추이 그래프 포인트 클릭 감지 및 연도 업데이트
         if line_event and "selection" in line_event and len(line_event["selection"]["points"]) > 0:
-            pie_year = line_event["selection"]["points"][0]["x"]
-        
+            clicked_point_x = line_event["selection"]["points"][0]["x"]
+            if clicked_point_x in years and clicked_point_x != st.session_state['pie_year']:
+                st.session_state['pie_year'] = int(clicked_point_x)
+                st.rerun()
+
+        # 연도 선택 슬라이더 (그래프 클릭과 100% 연동)
+        selected_pie_y = st.select_slider(
+            "🍰 원그래프 연도 선택:",
+            options=years,
+            value=st.session_state['pie_year'],
+            key="pie_year_slider"
+        )
+        if selected_pie_y != st.session_state['pie_year']:
+            st.session_state['pie_year'] = selected_pie_y
+            st.rerun()
+
         st.divider()
-        st.markdown(f"### 🍰 {pie_year}년 연령별 인구 비율")
+        st.markdown(f"### 🍰 {st.session_state['pie_year']}년 연령별 인구 구조 비율")
         
-        # 3) 선택 연도의 연령대별 원그래프(Pie Chart) 생성
-        region_age = age_data[(age_data['sigungu_code'] == code) & (age_data['연도'] == pie_year)]
+        # 3) 선택된 연도의 연령대별 원그래프(Pie Chart)
+        region_age = age_data[(age_data['sigungu_code'] == code) & (age_data['연도'] == st.session_state['pie_year'])]
         
         if not region_age.empty:
-            # 연령대를 10세 단위 및 65세 이상 구분그룹으로 묶기
             age_row = region_age.iloc[0]
             
-            # 연령대 그룹 생성 (0~14세, 15~64세, 65세 이상)
             group_0_14 = 0
             group_15_64 = 0
             group_65_plus = 0
@@ -261,19 +309,23 @@ if map_event and "selection" in map_event and len(map_event["selection"]["points
                 pie_df,
                 names='연령구분',
                 values='인구수',
-                title=f"{pie_year}년 {name} 인구 구조 비율",
+                title=f"{st.session_state['pie_year']}년 {name} 인구 구성",
                 color='연령구분',
                 color_discrete_map={
                     '유소년인구 (0~14세)': '#2b83ba',
                     '생산연령인구 (15~64세)': '#abdda4',
                     '고령인구 (65세 이상)': '#d7191c'
                 },
-                hole=0.3
+                hole=0.35
             )
             fig_pie.update_traces(textinfo='percent+label+value')
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
-            st.warning("해당 연도의 세부 연령 데이터가 존재하지 않습니다.")
+            st.warning("해당 연도의 인구 데이터가 없습니다.")
 
-    # Dialog 실행
-    show_detail_modal(clicked_code, target_name)
+        # 닫기 / 전체 지도로 복귀 버튼
+        if st.button("❌ 닫기 (전체 지도로 돌아가기)", use_container_width=True):
+            st.session_state['selected_region'] = "전체 (전국 지도)"
+            st.rerun()
+
+    show_detail_dialog(target_code, region_full_name)
